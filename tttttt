@@ -1,0 +1,151 @@
+// geo-query.ts
+
+import { BadRequestException } from '@nestjs/common';
+import { sql } from 'drizzle-orm';
+
+/**
+ * ===============================
+ * 1. ALLOWED TABLES + COLUMNS
+ * ===============================
+ * You MUST explicitly list allowed tables + geometry columns here.
+ * This prevents SQL injection when using dynamic identifiers.
+ */
+const ALLOWED_GEOMETRY_COLUMNS: Record<string, readonly string[]> = {
+  locations: ['geom', 'boundary'],
+  places: ['geom'],
+  zones: ['polygon'],
+};
+
+/**
+ * ===============================
+ * 2. SAFE IDENTIFIER QUOTING
+ * ===============================
+ * Escapes PostgreSQL identifiers safely.
+ */
+function quotePgIdentifier(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
+
+/**
+ * ===============================
+ * 3. VALIDATE TABLE + COLUMN
+ * ===============================
+ */
+function getSafeQualifiedColumn(
+  tableName: string,
+  columnName: string,
+): string {
+  const allowedColumns = ALLOWED_GEOMETRY_COLUMNS[tableName];
+
+  if (!allowedColumns) {
+    throw new BadRequestException(`Table "${tableName}" is not allowed`);
+  }
+
+  if (!allowedColumns.includes(columnName)) {
+    throw new BadRequestException(
+      `Column "${columnName}" is not allowed for table "${tableName}"`,
+    );
+  }
+
+  return `${quotePgIdentifier(tableName)}.${quotePgIdentifier(columnName)}`;
+}
+
+/**
+ * ===============================
+ * 4. MAIN FUNCTION
+ * ===============================
+ * Finds all rows whose geometry is strictly INSIDE the polygon
+ */
+export async function findRowsInsidePolygon<
+  TDb extends { execute: (query: ReturnType<typeof sql>) => Promise<unknown> }
+>(
+  db: TDb,
+  params: {
+    tableName: string;
+    geometryColumn: string;
+    polygonWkt: string;
+    srid?: number;
+  },
+) {
+  const { tableName, geometryColumn, polygonWkt, srid = 4326 } = params;
+
+  if (!polygonWkt?.trim()) {
+    throw new BadRequestException('polygonWkt is required');
+  }
+
+  const safeTable = quotePgIdentifier(tableName);
+  const qualifiedGeom = getSafeQualifiedColumn(tableName, geometryColumn);
+
+  return db.execute(sql`
+    SELECT *
+    FROM ${sql.raw(safeTable)}
+    WHERE ST_Within(
+      ${sql.raw(qualifiedGeom)},
+      ST_SetSRID(ST_GeomFromText(${polygonWkt}), ${srid})
+    )
+  `);
+}
+
+/**
+ * ===============================
+ * 5. OPTIONAL: INTERSECT VERSION
+ * ===============================
+ * Use this instead if you want ANY overlap (not strictly inside)
+ */
+export async function findRowsIntersectingPolygon<
+  TDb extends { execute: (query: ReturnType<typeof sql>) => Promise<unknown> }
+>(
+  db: TDb,
+  params: {
+    tableName: string;
+    geometryColumn: string;
+    polygonWkt: string;
+    srid?: number;
+  },
+) {
+  const { tableName, geometryColumn, polygonWkt, srid = 4326 } = params;
+
+  if (!polygonWkt?.trim()) {
+    throw new BadRequestException('polygonWkt is required');
+  }
+
+  const safeTable = quotePgIdentifier(tableName);
+  const qualifiedGeom = getSafeQualifiedColumn(tableName, geometryColumn);
+
+  return db.execute(sql`
+    SELECT *
+    FROM ${sql.raw(safeTable)}
+    WHERE ST_Intersects(
+      ${sql.raw(qualifiedGeom)},
+      ST_SetSRID(ST_GeomFromText(${polygonWkt}), ${srid})
+    )
+  `);
+}
+
+/**
+ * ===============================
+ * 6. EXAMPLE USAGE
+ * ===============================
+ *
+ * const rows = await findRowsInsidePolygon(db, {
+ *   tableName: 'locations',
+ *   geometryColumn: 'geom',
+ *   polygonWkt: 'POLYGON((34.8 32.0, 34.9 32.0, 34.9 32.1, 34.8 32.1, 34.8 32.0))',
+ * });
+ *
+ */
+
+/**
+ * ===============================
+ * 7. IMPORTANT DB REQUIREMENTS
+ * ===============================
+ *
+ * Enable PostGIS:
+ *   CREATE EXTENSION IF NOT EXISTS postgis;
+ *
+ * Add spatial index:
+ *   CREATE INDEX locations_geom_gist_idx
+ *   ON locations
+ *   USING GIST (geom);
+ *
+ */
