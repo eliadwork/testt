@@ -1,0 +1,176 @@
+Here are all the files:
+
+src/config/rabbitmq.config.ts
+
+import { registerAs } from '@nestjs/config';
+
+function requireEnv(key: string): string {
+  const value = process.env[key];
+  if (value === undefined || value === '') {
+    throw new Error(`Missing required environment variable: ${key}`);
+  }
+  return value;
+}
+
+function requireEnvInt(key: string): number {
+  const raw = requireEnv(key);
+  const parsed = parseInt(raw, 10);
+  if (isNaN(parsed)) {
+    throw new Error(`Environment variable ${key} must be an integer, got: "${raw}"`);
+  }
+  return parsed;
+}
+
+export interface RabbitMQConfigValues {
+  host: string;
+  port: number;
+  user: string;
+  password: string;
+  vhost: string;
+  exchange: string;
+  routingKey: string;
+}
+
+export default registerAs(
+  'rabbitmq',
+  (): RabbitMQConfigValues => ({
+    host: requireEnv('RABBITMQ_HOST'),
+    port: requireEnvInt('RABBITMQ_PORT'),
+    user: requireEnv('RABBITMQ_USER'),
+    password: requireEnv('RABBITMQ_PASSWORD'),
+    vhost: requireEnv('RABBITMQ_VHOST'),
+    exchange: requireEnv('RABBITMQ_EXCHANGE'),
+    routingKey: requireEnv('RABBITMQ_ROUTING_KEY'),
+  }),
+);
+
+src/rabbitmq/rabbitmq.module.ts
+
+import { Global, Module } from '@nestjs/common';
+import { ConfigType } from '@nestjs/config';
+import { RabbitMQModule } from '@golevelup/nestjs-rabbitmq';
+import rabbitmqConfig from '../config/rabbitmq.config';
+
+@Global()
+@Module({
+  imports: [
+    RabbitMQModule.forRootAsync(RabbitMQModule, {
+      inject: [rabbitmqConfig.KEY],
+      useFactory: (config: ConfigType<typeof rabbitmqConfig>) => ({
+        uri: {
+          protocol: 'amqp',
+          hostname: config.host,
+          port: config.port,
+          username: config.user,
+          password: config.password,
+          vhost: config.vhost,
+        },
+        exchanges: [
+          {
+            name: config.exchange,
+            type: 'topic' as const,
+            createExchangeIfNotExists: true,
+          },
+        ],
+        connectionInitOptions: { wait: true, timeout: 10_000, reject: true },
+      }),
+    }),
+  ],
+  exports: [RabbitMQModule],
+})
+export class RabbitMQWrapperModule {}
+
+src/messages/dto/publish-message.dto.ts
+
+import { IsObject } from 'class-validator';
+
+export class PublishMessageDto {
+  @IsObject()
+  payload!: Record<string, unknown>;
+}
+
+src/messages/messages.service.ts
+
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { ConfigType } from '@nestjs/config';
+import { AmqpConnection } from '@golevelup/nestjs-rabbitmq';
+import rabbitmqConfig from '../config/rabbitmq.config';
+
+@Injectable()
+export class MessagesService {
+  private readonly logger = new Logger(MessagesService.name);
+
+  constructor(
+    private readonly amqpConnection: AmqpConnection,
+    @Inject(rabbitmqConfig.KEY)
+    private readonly config: ConfigType<typeof rabbitmqConfig>,
+  ) {}
+
+  async publish(payload: Record<string, unknown>): Promise<void> {
+    const published = await this.amqpConnection.publish(
+      this.config.exchange,
+      this.config.routingKey,
+      payload,
+    );
+
+    if (!published) {
+      this.logger.warn(
+        `Message not confirmed by broker (exchange=${this.config.exchange}, routingKey=${this.config.routingKey})`,
+      );
+    }
+  }
+}
+
+src/messages/messages.controller.ts
+
+import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
+import { MessagesService } from './messages.service';
+import { PublishMessageDto } from './dto/publish-message.dto';
+
+@Controller('messages')
+export class MessagesController {
+  constructor(private readonly messagesService: MessagesService) {}
+
+  @Post()
+  @HttpCode(HttpStatus.ACCEPTED)
+  async publish(@Body() dto: PublishMessageDto): Promise<void> {
+    await this.messagesService.publish(dto.payload);
+  }
+}
+
+src/messages/messages.module.ts
+
+import { Module } from '@nestjs/common';
+import { MessagesController } from './messages.controller';
+import { MessagesService } from './messages.service';
+
+@Module({
+  controllers: [MessagesController],
+  providers: [MessagesService],
+})
+export class MessagesModule {}
+
+.env.example
+
+RABBITMQ_HOST=localhost
+RABBITMQ_PORT=5672
+RABBITMQ_USER=guest
+RABBITMQ_PASSWORD=guest
+RABBITMQ_VHOST=/
+RABBITMQ_EXCHANGE=messages
+RABBITMQ_ROUTING_KEY=messages.created
+APP_PORT=3000
+
+Add to app.module.ts imports:
+
+ConfigModule.forRoot({ isGlobal: true, load: [rabbitmqConfig], envFilePath: '.env' }),
+RabbitMQWrapperModule,
+MessagesModule,
+
+Add to main.ts if not already present:
+
+app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+
+Install:
+
+npm install @golevelup/nestjs-rabbitmq @nestjs/config class-validator class-transformer
